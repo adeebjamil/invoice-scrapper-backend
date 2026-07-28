@@ -53,6 +53,11 @@ class DownloadPayload(BaseModel):
     filename: Optional[str] = "bill_data.xlsx"
 
 
+class BulkDeletePayload(BaseModel):
+    ids: Optional[List[str]] = None
+
+
+
 # ---------------- Extraction Prompt ----------------
 EXTRACTION_PROMPT = """You are an expert invoice / bill / receipt data extractor.
 
@@ -300,9 +305,27 @@ async def download_excel(payload: DownloadPayload):
 
 
 @api_router.get("/history")
-async def get_history(limit: int = 20):
+async def get_history(limit: int = 50):
     docs = await db.extractions.find({}, {"_id": 0}).sort("created_at", -1).to_list(limit)
     return docs
+
+
+@api_router.delete("/history/{record_id}")
+async def delete_history_item(record_id: str):
+    res = await db.extractions.delete_one({"id": record_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "History item not found")
+    return {"status": "success", "deleted_id": record_id}
+
+
+@api_router.delete("/history")
+async def delete_history(payload: Optional[BulkDeletePayload] = None):
+    if payload and payload.ids:
+        res = await db.extractions.delete_many({"id": {"$in": payload.ids}})
+    else:
+        res = await db.extractions.delete_many({})
+    return {"status": "success", "deleted_count": res.deleted_count}
+
 
 
 app.include_router(api_router)
