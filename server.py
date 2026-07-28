@@ -206,10 +206,12 @@ async def _extract_via_openrouter(file_bytes: bytes, mime: str) -> Dict[str, Any
         raise HTTPException(500, "OPENROUTER_API_KEY missing in backend environment variables")
 
     models_to_try = [
-        os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free"),
-        "meta-llama/llama-3.2-11b-vision-instruct:free",
-        "qwen/qwen-2-vl-72b-instruct:free",
+        os.environ.get("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free"),
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-nano-12b-v2-vl:free",
+        "inclusionai/ling-3.0-flash:free",
     ]
+
 
     b64_data = base64.b64encode(file_bytes).decode("utf-8")
     content_list = [
