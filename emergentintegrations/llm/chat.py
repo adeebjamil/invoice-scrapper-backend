@@ -45,8 +45,8 @@ class LlmChat:
                     }
                 })
 
-        # Gemini model mapping fallback if 2.5-flash not supported directly
-        target_model = "gemini-1.5-flash" if "2.5" in self.model else self.model
+        # Gemini model mapping fallback
+        target_model = "gemini-1.5-flash" if ("2.5" in self.model or "1.5" in self.model) else self.model
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={self.api_key}"
         payload = {
@@ -58,7 +58,7 @@ class LlmChat:
             }
 
         async with httpx.AsyncClient(timeout=120.0) as client:
-            # Try Google Gemini REST API
+            # Send request to Google Gemini API
             resp = await client.post(url, json=payload)
             if resp.status_code == 200:
                 res_json = resp.json()
@@ -66,36 +66,21 @@ class LlmChat:
                     return res_json["candidates"][0]["content"]["parts"][0]["text"]
                 except (KeyError, IndexError):
                     return str(res_json)
-            
-            # Also attempt with original model name if substituted
-            if target_model != self.model:
-                url_orig = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
-                resp_orig = await client.post(url_orig, json=payload)
-                if resp_orig.status_code == 200:
-                    res_json = resp_orig.json()
+
+            # If gemini-1.5-flash failed, try gemini-1.5-pro or model as specified
+            if target_model != "gemini-1.5-pro":
+                url_pro = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={self.api_key}"
+                resp_pro = await client.post(url_pro, json=payload)
+                if resp_pro.status_code == 200:
+                    res_json_pro = resp_pro.json()
                     try:
-                        return res_json["candidates"][0]["content"]["parts"][0]["text"]
+                        return res_json_pro["candidates"][0]["content"]["parts"][0]["text"]
                     except (KeyError, IndexError):
-                        return str(res_json)
+                        return str(res_json_pro)
 
-            # Try Emergent Proxy
-            proxy_url = "https://api.emergentmethods.ai/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {self.api_key}"}
-            resp_proxy = await client.post(
-                proxy_url,
-                headers=headers,
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": self.system_message},
-                        {"role": "user", "content": message.text}
-                    ]
-                }
-            )
-            if resp_proxy.status_code == 200:
-                res_json_proxy = resp_proxy.json()
-                return res_json_proxy["choices"][0]["message"]["content"]
-
-            error_msg = f"Gemini API returned {resp.status_code}: {resp.text}"
+            # Provide clear error details
+            error_body = resp.text[:300]
+            error_msg = f"Gemini API returned HTTP {resp.status_code}. Details: {error_body}. Please verify GEMINI_API_KEY in environment variables."
             logger.error(error_msg)
             raise RuntimeError(error_msg)
+

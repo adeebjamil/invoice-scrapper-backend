@@ -130,15 +130,16 @@ def _normalize_extraction(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _extract_via_gemini(tmp_path: str, mime: str) -> Dict[str, Any]:
-    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("EMERGENT_LLM_KEY")
     if not api_key:
-        raise HTTPException(500, "EMERGENT_LLM_KEY missing in backend env")
+        raise HTTPException(500, "GEMINI_API_KEY or EMERGENT_LLM_KEY missing in backend environment variables")
 
     chat = LlmChat(
         api_key=api_key,
         session_id=str(uuid.uuid4()),
         system_message="You are a precise multilingual invoice table extractor.",
-    ).with_model("gemini", "gemini-2.5-flash")
+    ).with_model("gemini", "gemini-1.5-flash")
+
 
     file_attach = FileContentWithMimeType(file_path=tmp_path, mime_type=mime)
     msg = UserMessage(text=EXTRACTION_PROMPT, file_contents=[file_attach])
