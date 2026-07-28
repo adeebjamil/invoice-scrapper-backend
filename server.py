@@ -204,7 +204,12 @@ async def _extract_via_openrouter(file_bytes: bytes, mime: str) -> Dict[str, Any
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise HTTPException(500, "OPENROUTER_API_KEY missing in backend environment variables")
-    model = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
+
+    models_to_try = [
+        os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free"),
+        "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "qwen/qwen-2-vl-72b-instruct:free",
+    ]
 
     b64_data = base64.b64encode(file_bytes).decode("utf-8")
     content_list = [
@@ -217,26 +222,37 @@ async def _extract_via_openrouter(file_bytes: bytes, mime: str) -> Dict[str, Any
         }
     ]
 
+    last_err = None
     async with httpx.AsyncClient(timeout=120) as hc:
-        resp = await hc.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "user", "content": content_list}
-                ],
-            },
-        )
-        if resp.status_code != 200:
-            raise HTTPException(500, f"OpenRouter API returned {resp.status_code}: {resp.text[:300]}")
-        data = resp.json()
-        raw = data["choices"][0]["message"]["content"]
-        parsed = _extract_json_object(raw)
-        return _normalize_extraction(parsed)
+        for model in models_to_try:
+            try:
+                resp = await hc.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://invoice-scrapper-backend.onrender.com",
+                        "X-Title": "Bill To Sheet",
+                    },
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "user", "content": content_list}
+                        ],
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw = data["choices"][0]["message"]["content"]
+                    parsed = _extract_json_object(raw)
+                    return _normalize_extraction(parsed)
+                else:
+                    last_err = f"Model {model} returned HTTP {resp.status_code}: {resp.text[:200]}"
+            except Exception as e:
+                last_err = str(e)
+    
+    raise HTTPException(500, f"OpenRouter extraction failed: {last_err}")
+
 
 
 @api_router.post("/extract")
