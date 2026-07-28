@@ -200,6 +200,45 @@ ALLOWED_MIME = {
 }
 
 
+async def _extract_via_openrouter(file_bytes: bytes, mime: str) -> Dict[str, Any]:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise HTTPException(500, "OPENROUTER_API_KEY missing in backend environment variables")
+    model = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
+
+    b64_data = base64.b64encode(file_bytes).decode("utf-8")
+    content_list = [
+        {"type": "text", "text": EXTRACTION_PROMPT},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime};base64,{b64_data}"
+            }
+        }
+    ]
+
+    async with httpx.AsyncClient(timeout=120) as hc:
+        resp = await hc.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": content_list}
+                ],
+            },
+        )
+        if resp.status_code != 200:
+            raise HTTPException(500, f"OpenRouter API returned {resp.status_code}: {resp.text[:300]}")
+        data = resp.json()
+        raw = data["choices"][0]["message"]["content"]
+        parsed = _extract_json_object(raw)
+        return _normalize_extraction(parsed)
+
+
 @api_router.post("/extract")
 async def extract_bill(file: UploadFile = File(...)):
     filename = file.filename or "upload"
@@ -221,10 +260,13 @@ async def extract_bill(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        if os.environ.get("OLLAMA_URL"):
+        if os.environ.get("OPENROUTER_API_KEY"):
+            result = await _extract_via_openrouter(content, mime)
+        elif os.environ.get("OLLAMA_URL"):
             result = await _extract_via_ollama(content, mime)
         else:
             result = await _extract_via_gemini(tmp_path, mime)
+
 
         record = ExtractedTable(
             filename=filename,
