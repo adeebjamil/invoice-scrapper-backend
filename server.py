@@ -57,38 +57,42 @@ class BulkDeletePayload(BaseModel):
 
 
 # ---------------- Extraction Prompt ----------------
-EXTRACTION_PROMPT = """You are an expert invoice / bill / receipt data extractor.
+EXTRACTION_PROMPT = """You are a precise invoice / bill / receipt data extractor.
 
-Your job: extract the ITEM / LINE-ITEM TABLE from this document.
+TASK: Extract ONLY the line-item table from this document. Nothing else.
 
-The bill may be in ANY language: Arabic, Hindi, English, Urdu, Chinese, French, etc.
-Read the ORIGINAL script but if a header is in a non-Latin script, ALSO provide an English label
-for that column so it is usable in Excel. If a column is a currency amount, keep the numeric value in the row.
+RULES — read carefully:
+1. Look at the document and find the main product/service table with rows of items.
+2. Use EXACTLY the column headers you see printed in the document (in their original language).
+   - If the header is Arabic/Hindi/Urdu etc., write it exactly as-is.
+   - Do NOT add extra columns that do not exist in the document.
+   - Do NOT create columns like "None", "N/A", or placeholder columns.
+3. For each data row, fill in the value you actually see. If a cell is genuinely blank in the document, use an empty string "" — NOT the word "None".
+4. Only include columns that have actual data in most rows.
+5. The "columns" array must contain only the column names visible in the table header row.
 
-Return ONLY a strictly valid JSON object with this EXACT shape:
+Return ONLY this JSON — no markdown, no explanation, no extra text:
 
 {
-  "columns": ["col1", "col2", "col3"],
+  "columns": ["Header1", "Header2", "Header3"],
   "rows": [
-    {"col1": "value", "col2": "value", "col3": "value"},
-    {"col1": "value", "col2": "value", "col3": "value"}
+    {"Header1": "value", "Header2": "value", "Header3": "value"}
   ],
   "meta": {
-    "vendor": "name if visible else empty string",
-    "invoice_number": "if visible else empty string",
-    "date": "if visible else empty string",
-    "currency": "if visible else empty string",
-    "language_detected": "e.g. arabic / english / mixed"
+    "vendor": "vendor name or empty string",
+    "invoice_number": "invoice number or empty string",
+    "date": "date or empty string",
+    "currency": "currency code or symbol or empty string",
+    "language_detected": "english / arabic / hindi / mixed / etc"
   }
 }
 
-Hard rules:
-- Return ONLY the JSON. NO markdown fences, NO explanation, NO trailing text.
-- Every row MUST have the same keys as "columns".
-- Preserve numbers as strings exactly as printed (do NOT re-format).
-- Do NOT invent rows. Only extract what is visually present.
-- Include EVERY item row you can see, including subtotal / tax / total rows if they belong to the item table.
-- If there is no item table at all, return {"columns":[], "rows":[], "meta":{...}}.
+CRITICAL:
+- Return ONLY the JSON object. No ```json fences.
+- Every row must have ALL the same keys that are in "columns".
+- Missing cell value = "" (empty string), never the word "None".
+- Do NOT invent data. Only extract what is physically visible in the document.
+- If no table found: {"columns": [], "rows": [], "meta": {"vendor":"","invoice_number":"","date":"","currency":"","language_detected":""}}
 """
 
 
@@ -114,14 +118,43 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
 def _normalize_extraction(data: Dict[str, Any]) -> Dict[str, Any]:
     columns = data.get("columns") or []
     rows = data.get("rows") or []
-    # Ensure every row has all columns
+
+    # Strip columns that are clearly placeholder/empty
+    bad_values = {"none", "n/a", "null", "-", ""}
+    
+    # Find columns that have at least one real value
+    useful_columns = []
+    for c in columns:
+        col_str = str(c).strip()
+        if not col_str or col_str.lower() in bad_values:
+            continue
+        # Check if this column has any real data across rows
+        has_data = any(
+            str(r.get(c, "")).strip().lower() not in bad_values
+            for r in rows if isinstance(r, dict)
+        )
+        if has_data:
+            useful_columns.append(c)
+
+    # If filtering removed everything, keep originals (better than empty)
+    if not useful_columns and columns:
+        useful_columns = [c for c in columns if str(c).strip()]
+
+    # Normalize rows — replace "None" / "null" strings with ""
     normalized_rows = []
     for r in rows:
         if not isinstance(r, dict):
             continue
-        normalized_rows.append({c: str(r.get(c, "")) for c in columns})
+        clean_row = {}
+        for c in useful_columns:
+            val = str(r.get(c, "")).strip()
+            if val.lower() in {"none", "null", "n/a"}:
+                val = ""
+            clean_row[c] = val
+        normalized_rows.append(clean_row)
+
     return {
-        "columns": [str(c) for c in columns],
+        "columns": [str(c) for c in useful_columns],
         "rows": normalized_rows,
         "meta": data.get("meta") or {},
     }
@@ -357,29 +390,52 @@ async def download_excel(payload: DownloadPayload):
     ws = wb.active
     ws.title = "Bill Data"
 
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="09090B", end_color="09090B", fill_type="solid")
-    center = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    # Detect if content is RTL (Arabic/Hebrew/Urdu)
+    def is_rtl(text: str) -> bool:
+        return bool(re.search(r'[\u0590-\u05FF\u0600-\u06FF\u0750-\u077F]', str(text)))
 
+    rtl_content = any(is_rtl(c) for c in payload.columns)
+
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="09090B", end_color="09090B", fill_type="solid")
+    
+    h_align = "right" if rtl_content else "left"
+    header_align = Alignment(horizontal=h_align, vertical="center", wrap_text=True, reading_order=2 if rtl_content else 1)
+    cell_align  = Alignment(horizontal=h_align, vertical="center", wrap_text=True, reading_order=2 if rtl_content else 1)
+
+    # Write headers
     for i, col in enumerate(payload.columns, 1):
         cell = ws.cell(row=1, column=i, value=col)
         cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = center
+        cell.alignment = header_align
 
+    # Write data rows — try numeric conversion for number-like cells
     for r_idx, row in enumerate(payload.rows, 2):
         for c_idx, col in enumerate(payload.columns, 1):
-            val = row.get(col, "")
-            ws.cell(row=r_idx, column=c_idx, value=val).alignment = center
+            raw = row.get(col, "")
+            # Try to store as a real number so Excel can sum/sort
+            try:
+                if raw != "":
+                    num = float(str(raw).replace(",", ""))
+                    cell = ws.cell(row=r_idx, column=c_idx, value=num)
+                else:
+                    cell = ws.cell(row=r_idx, column=c_idx, value="")
+            except (ValueError, TypeError):
+                cell = ws.cell(row=r_idx, column=c_idx, value=str(raw))
+            cell.alignment = cell_align
 
-    # Auto-width (simple heuristic)
+    # Auto-width
     for c_idx, col in enumerate(payload.columns, 1):
         max_len = len(str(col))
         for row in payload.rows:
             v = str(row.get(col, ""))
             if len(v) > max_len:
                 max_len = len(v)
-        ws.column_dimensions[ws.cell(row=1, column=c_idx).column_letter].width = min(max(12, max_len + 2), 60)
+        ws.column_dimensions[ws.cell(row=1, column=c_idx).column_letter].width = min(max(14, max_len + 3), 60)
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
 
     buf = io.BytesIO()
     wb.save(buf)
