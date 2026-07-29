@@ -203,18 +203,15 @@ async def _extract_via_openrouter(file_bytes: bytes, mime: str) -> Dict[str, Any
     if not api_key or api_key == "sk-or-v1-REPLACE_WITH_YOUR_KEY":
         raise HTTPException(500, "OPENROUTER_API_KEY not configured. Please set a valid key in .env")
 
-    # All free vision-capable models on OpenRouter — tried in order
+    # Free vision-capable models on OpenRouter — verified & tried in order
     models_to_try = [
-        os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite-preview-02-05:free"),
-        "google/gemini-2.0-flash-lite-preview-02-05:free",
-        "google/gemini-2.5-flash-preview-05-20:free",
-        "google/gemini-flash-1.5-8b",
-        "qwen/qwen-2.5-vl-72b-instruct:free",
-        "qwen/qwen2.5-vl-32b-instruct:free",
-        "qwen/qwen2.5-vl-3b-instruct:free",
-        "meta-llama/llama-3.2-11b-vision-instruct:free",
-        "meta-llama/llama-3.2-90b-vision-instruct:free",
-        "mistralai/mistral-small-3.1-24b-instruct:free",
+        "openrouter/auto",                                    # Auto-selects best free model
+        "google/gemma-4-31b-it:free",                        # Google Gemma 4 31B vision (free)
+        "google/gemma-4-26b-a4b-it:free",                    # Google Gemma 4 26B vision (free)
+        "nvidia/nemotron-nano-12b-v2-vl:free",               # NVIDIA vision model (free)
+        "qwen/qwen2.5-vl-32b-instruct:free",                 # Qwen VL 32B (free)
+        "qwen/qwen2.5-vl-3b-instruct:free",                  # Qwen VL 3B (free)
+        os.environ.get("OPENROUTER_MODEL", "google/gemma-4-31b-it:free"),  # from .env
     ]
     # Deduplicate while preserving order
     seen = set()
