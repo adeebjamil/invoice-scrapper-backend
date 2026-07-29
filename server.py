@@ -20,8 +20,6 @@ import httpx
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContentWithMimeType
-
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
@@ -130,22 +128,8 @@ def _normalize_extraction(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _extract_via_gemini(tmp_path: str, mime: str) -> Dict[str, Any]:
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("EMERGENT_LLM_KEY")
-    if not api_key:
-        raise HTTPException(500, "GEMINI_API_KEY or EMERGENT_LLM_KEY missing in backend environment variables")
-
-    chat = LlmChat(
-        api_key=api_key,
-        session_id=str(uuid.uuid4()),
-        system_message="You are a precise multilingual invoice table extractor.",
-    ).with_model("gemini", "gemini-1.5-flash")
-
-
-    file_attach = FileContentWithMimeType(file_path=tmp_path, mime_type=mime)
-    msg = UserMessage(text=EXTRACTION_PROMPT, file_contents=[file_attach])
-    response = await chat.send_message(msg)
-    parsed = _extract_json_object(response if isinstance(response, str) else str(response))
-    return _normalize_extraction(parsed)
+    # Kept as a stub — use OpenRouter instead (set OPENROUTER_API_KEY in .env)
+    raise HTTPException(500, "Gemini provider disabled. Use OPENROUTER_API_KEY in .env")
 
 
 async def _extract_via_ollama(file_bytes: bytes, mime: str) -> Dict[str, Any]:
@@ -183,10 +167,24 @@ async def root():
 
 @api_router.get("/config")
 async def get_config():
+    has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY")) and os.environ.get("OPENROUTER_API_KEY") != "sk-or-v1-REPLACE_WITH_YOUR_KEY"
+    has_ollama = bool(os.environ.get("OLLAMA_URL"))
+
+    if has_openrouter:
+        provider = "openrouter"
+        model = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite-preview-02-05:free")
+    elif has_ollama:
+        provider = "ollama"
+        model = os.environ.get("OLLAMA_MODEL", "llama3.2-vision")
+    else:
+        provider = "none"
+        model = "none"
+
     return {
-        "backend_ready": True,
-        "provider": "ollama" if os.environ.get("OLLAMA_URL") else "gemini",
-        "model": os.environ.get("OLLAMA_MODEL", "gemini-2.5-flash"),
+        "backend_ready": provider != "none",
+        "provider": provider,
+        "model": model,
+        "openrouter_configured": has_openrouter,
     }
 
 
@@ -202,17 +200,30 @@ ALLOWED_MIME = {
 
 async def _extract_via_openrouter(file_bytes: bytes, mime: str) -> Dict[str, Any]:
     api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise HTTPException(500, "OPENROUTER_API_KEY missing in backend environment variables")
+    if not api_key or api_key == "sk-or-v1-REPLACE_WITH_YOUR_KEY":
+        raise HTTPException(500, "OPENROUTER_API_KEY not configured. Please set a valid key in .env")
 
+    # All free vision-capable models on OpenRouter — tried in order
     models_to_try = [
         os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-lite-preview-02-05:free"),
         "google/gemini-2.0-flash-lite-preview-02-05:free",
-        "google/gemini-flash-1.5",
-        "google/gemini-2.5-flash",
+        "google/gemini-2.5-flash-preview-05-20:free",
+        "google/gemini-flash-1.5-8b",
         "qwen/qwen-2.5-vl-72b-instruct:free",
+        "qwen/qwen2.5-vl-32b-instruct:free",
+        "qwen/qwen2.5-vl-3b-instruct:free",
         "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "meta-llama/llama-3.2-90b-vision-instruct:free",
+        "mistralai/mistral-small-3.1-24b-instruct:free",
     ]
+    # Deduplicate while preserving order
+    seen = set()
+    unique_models = []
+    for m in models_to_try:
+        if m and m not in seen:
+            seen.add(m)
+            unique_models.append(m)
+    models_to_try = unique_models
 
     b64_data = base64.b64encode(file_bytes).decode("utf-8")
     content_list = [
@@ -225,10 +236,11 @@ async def _extract_via_openrouter(file_bytes: bytes, mime: str) -> Dict[str, Any
         }
     ]
 
-    last_err = None
+    errors = []
     async with httpx.AsyncClient(timeout=180) as hc:
         for model in models_to_try:
             try:
+                logger.info(f"Trying OpenRouter model: {model}")
                 resp = await hc.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
@@ -247,30 +259,25 @@ async def _extract_via_openrouter(file_bytes: bytes, mime: str) -> Dict[str, Any
                 if resp.status_code == 200:
                     data = resp.json()
                     raw = data["choices"][0]["message"]["content"]
+                    logger.info(f"Success with model: {model}")
                     parsed = _extract_json_object(raw)
                     return _normalize_extraction(parsed)
                 else:
-                    last_err = f"Model {model} returned HTTP {resp.status_code}: {resp.text[:200]}"
+                    err_msg = f"Model {model} → HTTP {resp.status_code}: {resp.text[:300]}"
+                    logger.warning(err_msg)
+                    errors.append(err_msg)
             except Exception as e:
-                last_err = str(e)
-    
-    logger.warning(f"OpenRouter models failed: {last_err}. Using fallback structured extraction.")
-    fallback_result = {
-        "columns": ["Item Description", "Qty", "Unit Price", "Total Amount"],
-        "rows": [
-            {"Item Description": "Multilingual Invoice Processing", "Qty": "1", "Unit Price": "150.00", "Total Amount": "150.00"},
-            {"Item Description": "OCR Table Extraction Service", "Qty": "2", "Unit Price": "45.00", "Total Amount": "90.00"},
-            {"Item Description": "Excel (.xlsx) Export Formatting", "Qty": "1", "Unit Price": "25.00", "Total Amount": "25.00"}
-        ],
-        "meta": {
-            "vendor": "Sample Vendor Ltd.",
-            "invoice_number": "INV-2026-001",
-            "date": "2026-07-29",
-            "currency": "USD",
-            "language_detected": "English / Multilingual OCR"
-        }
-    }
-    return fallback_result
+                err_msg = f"Model {model} → Exception: {str(e)[:200]}"
+                logger.warning(err_msg)
+                errors.append(err_msg)
+
+    # All models failed — raise a real error instead of returning fake data
+    raise HTTPException(
+        502,
+        f"All {len(models_to_try)} OpenRouter models failed. "
+        f"Check your API key and model availability. "
+        f"Last errors: {'; '.join(errors[-3:])}"
+    )
 
 
 
@@ -296,13 +303,22 @@ async def extract_bill(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        if os.environ.get("OPENROUTER_API_KEY"):
+        # Try providers in priority order
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+        has_openrouter = bool(openrouter_key) and openrouter_key != "sk-or-v1-REPLACE_WITH_YOUR_KEY"
+        has_ollama = bool(os.environ.get("OLLAMA_URL"))
+
+        if has_openrouter:
+            logger.info("Using OpenRouter for extraction")
             result = await _extract_via_openrouter(content, mime)
-        elif os.environ.get("OLLAMA_URL"):
+        elif has_ollama:
+            logger.info("Using Ollama for extraction")
             result = await _extract_via_ollama(content, mime)
         else:
-            result = await _extract_via_gemini(tmp_path, mime)
-
+            raise HTTPException(
+                500,
+                "No AI provider configured. Set OPENROUTER_API_KEY (free at openrouter.ai) in backend/.env"
+            )
 
         record = ExtractedTable(
             filename=filename,
@@ -313,7 +329,7 @@ async def extract_bill(file: UploadFile = File(...)):
         # Persist history (best-effort, never break the API)
         try:
             await db.extractions.insert_one(record.model_dump())
-        except Exception as e:  # pragma: no cover
+        except Exception as e:
             logger.warning("Failed to persist extraction: %s", e)
 
         return {
