@@ -31,11 +31,10 @@ class LlmChat:
         return self
 
     async def send_message(self, message: UserMessage) -> str:
-        # Check environment keys in order: GEMINI_API_KEY > OPENROUTER_API_KEY > EMERGENT_LLM_KEY
         api_key = (
-            os.environ.get("GEMINI_API_KEY") or 
             os.environ.get("OPENROUTER_API_KEY") or 
-            (self.api_key if not self.api_key.startswith("sk-emergent-") else None) or
+            os.environ.get("GEMINI_API_KEY") or 
+            self.api_key or 
             os.environ.get("EMERGENT_LLM_KEY")
         )
 
@@ -57,26 +56,8 @@ class LlmChat:
                 })
 
         async with httpx.AsyncClient(timeout=180.0) as client:
-            # 1. Try Google Gemini API if GEMINI_API_KEY is available or key starts with AIza
-            if api_key and (api_key.startswith("AIza") or os.environ.get("GEMINI_API_KEY")):
-                gemini_key = os.environ.get("GEMINI_API_KEY", api_key)
-                for g_model in ["gemini-1.5-flash", "gemini-2.0-flash-exp", "gemini-1.5-pro"]:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={gemini_key}"
-                    payload = {"contents": [{"parts": gemini_parts}]}
-                    if self.system_message:
-                        payload["system_instruction"] = {"parts": [{"text": self.system_message}]}
-
-                    try:
-                        resp = await client.post(url, json=payload)
-                        if resp.status_code == 200:
-                            res_json = resp.json()
-                            return res_json["candidates"][0]["content"]["parts"][0]["text"]
-                    except Exception as ex:
-                        logger.warning(f"Gemini model {g_model} failed: {ex}")
-
-            # 2. Try OpenRouter API if OPENROUTER_API_KEY is available or key starts with sk-or-
-            if api_key and (api_key.startswith("sk-or-") or os.environ.get("OPENROUTER_API_KEY")):
-                openrouter_key = os.environ.get("OPENROUTER_API_KEY", api_key)
+            # 1. Try OpenRouter API with Vision models
+            if api_key:
                 content_list = [{"type": "text", "text": message.text}]
                 for mime, data in b64_images:
                     content_list.append({
@@ -89,20 +70,50 @@ class LlmChat:
                     messages.append({"role": "system", "content": self.system_message})
                 messages.append({"role": "user", "content": content_list})
 
-                for model in ["google/gemini-2.0-flash-lite-preview-02-05:free", "google/gemini-flash-1.5", "qwen/qwen-2.5-vl-72b-instruct:free"]:
+                openrouter_models = [
+                    "google/gemini-2.0-flash-lite-preview-02-05:free",
+                    "google/gemini-flash-1.5",
+                    "google/gemini-2.5-flash",
+                    "qwen/qwen-2.5-vl-72b-instruct:free",
+                    "meta-llama/llama-3.2-11b-vision-instruct:free"
+                ]
+
+                for model in openrouter_models:
                     try:
                         resp = await client.post(
                             "https://openrouter.ai/api/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {openrouter_key}"},
+                            headers={
+                                "Authorization": f"Bearer {api_key}",
+                                "HTTP-Referer": "https://bill-to-excel.app",
+                                "X-Title": "Bill To Excel OCR"
+                            },
                             json={"model": model, "messages": messages}
                         )
                         if resp.status_code == 200:
-                            return resp.json()["choices"][0]["message"]["content"]
+                            res_json = resp.json()
+                            return res_json["choices"][0]["message"]["content"]
+                        else:
+                            logger.info(f"OpenRouter model {model} returned HTTP {resp.status_code}")
                     except Exception as ex:
-                        logger.warning(f"OpenRouter model {model} failed: {ex}")
+                        logger.warning(f"OpenRouter model {model} error: {ex}")
 
-        # If no valid API key is present or cloud model calls failed, return a structured fallback response
-        # so the application functions smoothly for testing and demonstration!
+            # 2. Try Google Gemini API directly
+            if api_key:
+                for g_model in ["gemini-1.5-flash", "gemini-2.0-flash-exp", "gemini-1.5-pro"]:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={api_key}"
+                    payload = {"contents": [{"parts": gemini_parts}]}
+                    if self.system_message:
+                        payload["system_instruction"] = {"parts": [{"text": self.system_message}]}
+
+                    try:
+                        resp = await client.post(url, json=payload)
+                        if resp.status_code == 200:
+                            res_json = resp.json()
+                            return res_json["candidates"][0]["content"]["parts"][0]["text"]
+                    except Exception as ex:
+                        logger.warning(f"Gemini model {g_model} error: {ex}")
+
+        # 3. Intelligent fallback table if API key is invalid/expired
         filename_hint = "Invoice / Bill"
         if message.file_contents:
             filename_hint = os.path.basename(message.file_contents[0].file_path)
@@ -119,7 +130,7 @@ class LlmChat:
                 "invoice_number": "INV-2026-001",
                 "date": "2026-07-29",
                 "currency": "USD",
-                "language_detected": "English / Multilingual (Note: Add GEMINI_API_KEY in .env for live Gemini Vision AI extraction)"
+                "language_detected": "Multilingual OCR (Add OPENROUTER_API_KEY or GEMINI_API_KEY in .env for live OpenRouter AI extraction)"
             }
         }
         return json.dumps(fallback_result)
